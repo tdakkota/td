@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 	"golang.org/x/xerrors"
 
@@ -122,7 +123,7 @@ func BotFromEnvironment(ctx context.Context, opts Options, cb func(ctx context.C
 }
 
 func retry(ctx context.Context, cb func(ctx context.Context) error) error {
-	b := backoff.WithContext(backoff.NewExponentialBackOff(), ctx)
+	b := backoff.NewExponentialBackOff()
 
 	return backoff.Retry(func() error {
 		if err := cb(ctx); err != nil {
@@ -144,11 +145,16 @@ func retry(ctx context.Context, cb func(ctx context.Context) error) error {
 				return err
 			}
 
+			if errors.Is(err, ErrPasswordAuthNeeded) {
+				// Possibly someone changed test user password.
+				return err
+			}
+
 			return backoff.Permanent(err)
 		}
 
 		return nil
-	}, b)
+	}, backoff.WithContext(b, ctx))
 }
 
 // TestClient creates and authenticates user telegram.Client
@@ -168,6 +174,7 @@ func TestClient(ctx context.Context, opts Options, cb func(ctx context.Context, 
 				TestAuth(rand.Reader, 2),
 				SendCodeOptions{},
 			).Run(runCtx, client); err != nil {
+				client.log.Warn("Auth failed", zap.Error(err))
 				return xerrors.Errorf("auth flow: %w", err)
 			}
 
