@@ -1,6 +1,9 @@
 package mtproto
 
 import (
+	"fmt"
+
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/gotd/td/bin"
@@ -32,6 +35,9 @@ func (c *Conn) handleMessage(b *bin.Buffer) error {
 	case proto.GZIPTypeID:
 		return c.handleGZIP(b)
 	default:
+		c.log.Info("Got message", zap.String("type_id", fmt.Sprintf("%x", id)))
+		defer c.log.Info("Message consumed")
+
 		return c.handler.OnMessage(b)
 	}
 }

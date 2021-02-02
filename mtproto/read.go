@@ -166,6 +166,7 @@ func (c *Conn) readEncryptedMessages(ctx context.Context) error {
 			}
 			b.ResetTo(msg.Data())
 
+			c.log.Debug("Read message", zap.Int64("session_id", msg.SessionID))
 			if err := c.handleMessage(b); err != nil {
 				// Probably we can return here, but this will shutdown whole
 				// connection which can be unexpected.

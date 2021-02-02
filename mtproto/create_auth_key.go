@@ -3,6 +3,8 @@ package mtproto
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	"github.com/gotd/td/internal/exchange"
 )
 
@@ -17,6 +19,7 @@ func (c *Conn) createAuthKey(ctx context.Context) error {
 		return err
 	}
 
+	c.log.Debug("Session ID saved", zap.Int64("session_id", r.SessionID))
 	c.sessionMux.Lock()
 	c.authKey = r.AuthKey
 	c.sessionID = r.SessionID

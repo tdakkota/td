@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
@@ -81,7 +82,7 @@ type Conn struct {
 	readConcurrency int
 	messages        chan *crypto.EncryptedMessageData
 
-	closed bool
+	closed atomic.Bool
 }
 
 // New creates new unstarted connection.
@@ -130,7 +131,7 @@ func New(addr string, opt Options) *Conn {
 // handleClose closes rpc engine and underlying connection on context done.
 func (c *Conn) handleClose(ctx context.Context) error {
 	<-ctx.Done()
-	c.log.Debug("Closing")
+	c.log.Debug("Closing MTProto connection")
 
 	// Close RPC Engine.
 	c.rpc.ForceClose()
@@ -138,7 +139,7 @@ func (c *Conn) handleClose(ctx context.Context) error {
 	if err := c.conn.Close(); err != nil {
 		c.log.Debug("Failed to cleanup connection", zap.Error(err))
 	}
-	c.closed = true
+	c.closed.Store(true)
 	return nil
 }
 
@@ -150,7 +151,7 @@ func (c *Conn) Run(ctx context.Context, f func(ctx context.Context) error) error
 	//
 	// This will send initial packet to telegram and perform key exchange
 	// if needed.
-	if c.closed {
+	if c.closed.Load() {
 		return xerrors.New("failed to Run closed connection")
 	}
 

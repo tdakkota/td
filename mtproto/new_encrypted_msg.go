@@ -11,8 +11,8 @@ func (c *Conn) newEncryptedMessage(id int64, seq int32, payload bin.Encoder, b *
 	if err := payload.Encode(b); err != nil {
 		return err
 	}
-	c.logWithType(b).Debug("Request", zap.Int64("msg_id", id))
 	s := c.session()
+	c.logWithType(b).Debug("Request", zap.Int64("msg_id", id), zap.Int64("session_id", s.ID))
 	d := crypto.EncryptedMessageData{
 		SessionID:              s.ID,
 		Salt:                   s.Salt,

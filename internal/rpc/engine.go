@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
@@ -32,7 +32,7 @@ type Engine struct {
 	reqCancel context.CancelFunc
 
 	wg     sync.WaitGroup
-	closed uint32
+	closed atomic.Bool
 }
 
 // Send is a function that sends requests to the server.
@@ -78,7 +78,7 @@ type Request struct {
 // Do sends request to server and blocks until response is received, performing
 // multiple retries if needed.
 func (e *Engine) Do(ctx context.Context, req Request) error {
-	if e.isClosed() {
+	if e.closed.Load() {
 		return ErrEngineClosed
 	}
 
@@ -97,13 +97,13 @@ func (e *Engine) Do(ctx context.Context, req Request) error {
 		// Handler result.
 		resultErr error
 		// Needed to prevent multiple handler calls.
-		handlerCalls uint32
+		handlerCalls = atomic.NewUint32(0)
 	)
 
 	handler := func(rpcBuff *bin.Buffer, rpcErr error) error {
 		log.Debug("Handler called")
 
-		if calls := atomic.AddUint32(&handlerCalls, 1); calls > 1 {
+		if calls := handlerCalls.Inc(); calls > 1 {
 			log.Warn("Handler already called")
 
 			return xerrors.Errorf("handler already called")
@@ -234,15 +234,13 @@ func (e *Engine) NotifyError(msgID int64, rpcErr error) {
 	_ = fn(nil, rpcErr)
 }
 
-func (e *Engine) isClosed() bool {
-	return atomic.LoadUint32(&e.closed) == 1
-}
-
 // Close gracefully closes the engine.
 // All pending requests will be awaited.
 // All Do method calls of closed engine will return ErrEngineClosed error.
 func (e *Engine) Close() {
-	atomic.StoreUint32(&e.closed, 1)
+	if e.closed.Swap(true) {
+		return // Already closed.
+	}
 	e.log.Info("Close called")
 	e.wg.Wait()
 }

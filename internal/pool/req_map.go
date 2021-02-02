@@ -33,8 +33,8 @@ func (r *reqMap) request() (key reqKey, ch chan *poolConn) {
 
 func (r *reqMap) transfer(c *poolConn) bool {
 	r.mux.Lock()
-	defer r.mux.Unlock()
 	if len(r.m) < 1 { // no requests
+		r.mux.Unlock()
 		return false
 	}
 
@@ -44,6 +44,7 @@ func (r *reqMap) transfer(c *poolConn) bool {
 		break
 	}
 	delete(r.m, k) // Remove from pending requests.
+	r.mux.Unlock()
 
 	if ch == nil {
 		panic("unreachable: channel can't be nil due to map not empty")

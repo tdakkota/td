@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -58,13 +59,20 @@ type conn struct {
 
 	sessionInit *tdsync.Ready // immutable
 	gotConfig   *tdsync.Ready // immutable
+	dead        *tdsync.Ready // immutable
 }
+
+var errConnDead = xerrors.New("connection dead")
 
 func (c *conn) OnSession(session mtproto.Session) error {
 	c.sessionInit.Signal()
 
 	// Waiting for config, because OnSession can occur before we set config.
-	<-c.gotConfig.Ready()
+	select {
+	case <-c.gotConfig.Ready():
+	case <-c.dead.Ready():
+		return errConnDead
+	}
 
 	c.mux.Lock()
 	cfg := c.cfg
@@ -74,6 +82,10 @@ func (c *conn) OnSession(session mtproto.Session) error {
 }
 
 func (c *conn) OnMessage(b *bin.Buffer) error {
+	id, _ := b.PeekID()
+	c.log.Info("Got message", zap.String("type_id", fmt.Sprintf("%x", id)))
+	defer c.log.Info("Message consumed")
+
 	return c.handler.OnMessage(b)
 }
 
@@ -84,7 +96,23 @@ func (c *conn) InvokeRaw(ctx context.Context, input bin.Encoder, output bin.Deco
 		return xerrors.Errorf("waitSession: %w", err)
 	}
 
-	return c.proto.InvokeRaw(ctx, input, output)
+	return c.proto.InvokeRaw(ctx, c.wrapRequest(noopDecoder{input}), output)
+}
+
+type noopDecoder struct {
+	bin.Encoder
+}
+
+func (n noopDecoder) Decode(b *bin.Buffer) error {
+	return xerrors.New("should not be used as decoder")
+}
+
+func (c *conn) wrapRequest(input bin.Object) bin.Object {
+	if c.mode != connModeUpdates {
+		return &tg.InvokeWithoutUpdatesRequest{Query: input}
+	}
+
+	return input
 }
 
 func (c *conn) trackInvoke() func() {
@@ -115,9 +143,15 @@ func (c *conn) waitSession(ctx context.Context) error {
 	select {
 	case <-c.sessionInit.Ready():
 		return nil
+	case <-c.dead.Ready():
+		return errConnDead
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (c *conn) Dead() <-chan struct{} {
+	return c.dead.Ready()
 }
 
 func (c *conn) Ready() <-chan struct{} {
@@ -125,16 +159,27 @@ func (c *conn) Ready() <-chan struct{} {
 }
 
 func (c *conn) Init(ctx context.Context, appID int, device DeviceConfig) error {
-	return c.proto.Run(ctx, func(ctx context.Context) error {
-		return c.init(ctx, appID, device)
+	defer c.dead.Signal()
+
+	return c.proto.Run(ctx, func(runCtx context.Context) error {
+		go func() {
+			select {
+			case <-runCtx.Done():
+				c.dead.Signal()
+			case <-c.Dead():
+			case <-ctx.Done():
+			}
+		}()
+		return c.init(runCtx, appID, device)
 	})
 }
 
 func (c *conn) init(ctx context.Context, appID int, device DeviceConfig) error {
 	defer c.gotConfig.Signal()
 	c.log.Debug("Initializing")
+	defer c.log.Debug("Initialized")
 
-	q := &tg.InitConnectionRequest{
+	q := c.wrapRequest(&tg.InitConnectionRequest{
 		APIID:          appID,
 		DeviceModel:    device.DeviceModel,
 		SystemVersion:  device.SystemVersion,
@@ -142,18 +187,12 @@ func (c *conn) init(ctx context.Context, appID int, device DeviceConfig) error {
 		SystemLangCode: device.SystemLangCode,
 		LangPack:       device.LangPack,
 		LangCode:       device.LangCode,
-		Query:          &tg.HelpGetConfigRequest{},
-	}
-	var req bin.Object = &tg.InvokeWithLayerRequest{
+		Query:          c.wrapRequest(&tg.HelpGetConfigRequest{}),
+	})
+	req := c.wrapRequest(&tg.InvokeWithLayerRequest{
 		Layer: tg.Layer,
 		Query: q,
-	}
-	if c.mode == connModeData || c.mode == connModeCDN {
-		// This connection will not receive updates.
-		req = &tg.InvokeWithoutUpdatesRequest{
-			Query: req,
-		}
-	}
+	})
 
 	var cfg tg.Config
 	if err := c.proto.InvokeRaw(ctx, req, &cfg); err != nil {
@@ -173,6 +212,7 @@ func newConn(
 	addr string,
 	mode connMode,
 	opt mtproto.Options,
+	createProto protoCreator,
 ) *conn {
 	c := &conn{
 		mode:        mode,
@@ -182,8 +222,9 @@ func newConn(
 		handler:     handler,
 		sessionInit: tdsync.NewReady(),
 		gotConfig:   tdsync.NewReady(),
+		dead:        tdsync.NewReady(),
 	}
 	opt.Handler = c
-	c.proto = mtproto.New(addr, opt)
+	c.proto = createProto(addr, opt)
 	return c
 }

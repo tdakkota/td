@@ -15,9 +15,6 @@ type Supervisor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	err     error
-	onceErr sync.Once
-
 	onError func(err error)
 }
 
@@ -48,10 +45,6 @@ func (s *Supervisor) Go(task func(ctx context.Context) error) {
 			if s.onError != nil {
 				s.onError(err)
 			}
-
-			s.onceErr.Do(func() {
-				s.err = err
-			})
 		}
 	}()
 }
@@ -67,5 +60,5 @@ func (s *Supervisor) Cancel() {
 // returns the first non-nil error (if any) from them.
 func (s *Supervisor) Wait() error {
 	s.wg.Wait()
-	return s.err
+	return nil
 }

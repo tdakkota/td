@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"go.uber.org/atomic"
@@ -14,6 +15,8 @@ import (
 	"github.com/gotd/td/mtproto"
 	"github.com/gotd/td/tg"
 )
+
+type protoCreator func(addr string, opt mtproto.Options) protoConn
 
 // DCOptions is a Telegram data center connections pool options.
 type DCOptions struct {
@@ -47,6 +50,9 @@ type DC struct {
 	// Telegram device information.
 	device DeviceConfig // immutable
 
+	// Creator of MTProto connections.
+	protoCreator // immutable
+
 	// Wrappers for external world, like logs or PRNG.
 	log *zap.Logger // immutable
 
@@ -60,21 +66,28 @@ type DC struct {
 	// Connections supervisor.
 	grp *tdsync.Supervisor
 	// Free connections.
-	free    []*poolConn
-	freeMux sync.Mutex
-	freeReq *reqMap
-
+	free []*poolConn
 	// Total connections.
-	total atomic.Int64
+	total int64
+	// Connection id monotonic counter.
+	nextConn atomic.Int64
+	freeReq  *reqMap
+	// DC mutex.
+	mu sync.Mutex
+
 	// Limit of connections.
 	max int64 // immutable
+
+	// Signal connection for cases when all connections are dead, but all requests waiting for
+	// free connection in 3rd acquire case.
+	stuck *tdsync.ResetReady
 
 	// Requests wait group.
 	ongoing sync.WaitGroup
 
-	ready       *tdsync.Ready
-	closed      atomic.Bool
-	nextRequest atomic.Int64
+	// State of DC.
+	ready  *tdsync.ResetReady
+	closed atomic.Bool
 }
 
 // NewDC creates new uninitialized DC.
@@ -85,27 +98,36 @@ func NewDC(id dcID, addr string, handler ConnHandler, opts DCOptions) *DC {
 		id:      id,
 		addr:    addr,
 		opts:    opts.MTProto,
+		authKey: opts.MTProto.Key,
+		salt:    opts.MTProto.Salt,
 		appID:   opts.AppID,
 		device:  opts.Device,
-		handler: handler,
+		protoCreator: protoCreator(func(addr string, opt mtproto.Options) protoConn {
+			return mtproto.New(addr, opt)
+		}),
 		log:     opts.Logger,
+		handler: handler,
 		ctx:     ctx,
 		cancel:  cancel,
 		grp:     tdsync.NewSupervisor(ctx),
 		freeReq: newReqMap(),
 		max:     opts.MaxOpenConnections,
-		ready:   tdsync.NewReady(),
+		stuck:   tdsync.NewResetReady(),
+		ready:   tdsync.NewResetReady(),
 	}
 }
 
 // OnSession implements ConnHandler.
 func (c *DC) OnSession(addr string, cfg tg.Config, s mtproto.Session) error {
-	c.log.Debug("Session created")
-
 	c.sessionMux.Lock()
 	c.salt = s.Salt
+	noSessionBefore := c.authKey.Zero()
 	c.authKey = s.Key
 	c.sessionMux.Unlock()
+
+	if noSessionBefore {
+		c.log.Debug("DC Session saved")
+	}
 	c.ready.Signal()
 
 	return c.handler.OnSession(addr, cfg, s)
@@ -113,49 +135,58 @@ func (c *DC) OnSession(addr string, cfg tg.Config, s mtproto.Session) error {
 
 // OnMessage implements ConnHandler.
 func (c *DC) OnMessage(b *bin.Buffer) error {
+	id, _ := b.PeekID()
+	c.log.Info("Got message", zap.String("type_id", fmt.Sprintf("%x", id)))
+	defer c.log.Info("Message consumed")
+
 	return c.handler.OnMessage(b)
 }
 
-func (c *DC) createConnection(mode connMode) *poolConn {
-	c.log.Debug(
-		"Creating new connection",
-		zap.String("addr", c.addr),
-		zap.Int64("total", c.total.Load()),
-	)
-
+func (c *DC) createConnection(id int64, mode connMode) *poolConn {
 	opts := c.opts
-	opts.Logger = c.log.Named("conn").With(zap.Int64("conn_id", c.nextRequest.Inc()))
+	opts.Logger = c.log.Named("conn").With(zap.Int64("conn_id", id))
+	// Load stored session.
+	c.sessionMux.Lock()
+	opts.Salt = c.salt
+	opts.Key = c.authKey
+	c.sessionMux.Unlock()
+
 	conn := &poolConn{
-		conn: newConn(c, c.addr, mode, opts),
-		dc:   c,
+		conn:    newConn(c, c.addr, mode, opts, c.protoCreator),
+		dc:      c,
+		id:      id,
+		deleted: atomic.NewBool(false),
 	}
 
-	c.grp.Go(func(groupCtx context.Context) error {
-		c.total.Inc()
-		defer c.total.Dec()
-		defer c.dead(conn)
-
+	c.grp.Go(func(groupCtx context.Context) (err error) {
+		if mode != connModeUpdates {
+			defer c.dead(conn, err)
+		}
 		return conn.Init(groupCtx, c.appID, c.device)
 	})
 
 	return conn
 }
 
-func (c *DC) dead(r *poolConn) {
-	c.log.Debug(
-		"Dead connection",
-		zap.String("addr", c.addr),
-		zap.Int64("total", c.total.Load()),
-	)
+func (c *DC) dead(r *poolConn, deadErr error) {
+	if r.deleted.Swap(true) {
+		return // Already deleted.
+	}
 
-	r.dead.Store(true)
-	c.freeMux.Lock()
-	defer c.freeMux.Unlock()
+	c.stuck.Reset()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.total--
+	remaining := c.total
+	if remaining < 0 {
+		panic("unreachable: remaining can'be less than zero")
+	}
 
 	idx := -1
 	for i, conn := range c.free {
 		// Search connection by pointer.
-		if conn == r {
+		if conn.id == r.id {
 			idx = i
 		}
 	}
@@ -167,12 +198,17 @@ func (c *DC) dead(r *poolConn) {
 		c.free[len(c.free)-1] = nil
 		c.free = c.free[:len(c.free)-1]
 	}
+
+	r.log.Debug(
+		"Connection died",
+		zap.String("addr", c.addr),
+		zap.Int64("remaining", remaining),
+		zap.Int64("conn_id", r.id),
+		zap.Error(deadErr),
+	)
 }
 
 func (c *DC) pop() (r *poolConn, ok bool) {
-	c.freeMux.Lock()
-	defer c.freeMux.Unlock()
-
 	l := len(c.free)
 	if l > 0 {
 		r, c.free = c.free[l-1], c.free[:l-1]
@@ -184,27 +220,64 @@ func (c *DC) pop() (r *poolConn, ok bool) {
 }
 
 func (c *DC) release(r *poolConn) {
-	if c.freeReq.transfer(r) {
+	if r == nil {
 		return
 	}
-	c.freeMux.Lock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.freeReq.transfer(r) {
+		c.log.Debug("Transfer connection to requester", zap.Int64("conn_id", r.id))
+		return
+	}
+	c.log.Debug("Connection released", zap.Int64("conn_id", r.id))
 	c.free = append(c.free, r)
-	c.freeMux.Unlock()
+}
+
+func (c *DC) request() (key reqKey, ch chan *poolConn) {
+	return c.freeReq.request()
 }
 
 var errDCIsClosed = xerrors.New("DC is closed")
 
 func (c *DC) acquire(ctx context.Context) (r *poolConn, err error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.ctx.Done(): // If DC forcibly closed — exit.
+		return nil, xerrors.Errorf("DC closed: %w", c.ctx.Err())
+	case <-c.ready.Ready(): // Await for ready if it not a initialization connection.
+	}
+
+retry:
+	c.mu.Lock()
 	// 1st case: have free connections.
 	if r, ok := c.pop(); ok {
+		c.mu.Unlock()
+		select {
+		case <-r.Dead():
+			c.dead(r, nil)
+			goto retry
+		default:
+		}
+		c.log.Debug("Re-using free connection", zap.Int64("conn_id", r.id))
 		return r, nil
 	}
 
 	// 2nd case: no free connections, but can create one.
 	// c.max < 1 means unlimited
-	if c.max < 1 || c.total.Load() < c.max {
-		conn := c.createConnection(connModeUpdates)
+	if c.max < 1 || c.total < c.max {
+		c.total++
+		c.mu.Unlock()
 
+		id := c.nextConn.Inc()
+		c.log.Debug(
+			"Creating new connection",
+			zap.String("addr", c.addr),
+			zap.Int64("conn_id", id),
+		)
+		conn := c.createConnection(id, connModeData)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -212,16 +285,37 @@ func (c *DC) acquire(ctx context.Context) (r *poolConn, err error) {
 			return nil, xerrors.Errorf("DC closed: %w", c.ctx.Err())
 		case <-conn.Ready():
 			return conn, nil
+		case <-conn.Dead():
+			c.dead(conn, nil)
+			goto retry
 		}
 	}
 
 	// 3rd case: no free connections, can't create yet one, wait for free.
 	key, ch := c.freeReq.request()
+	c.mu.Unlock()
+	c.log.Debug("Waiting for free connect", zap.Int64("request_id", int64(key)))
 
 	select {
 	case conn := <-ch:
+		c.log.Debug("Got connection for request",
+			zap.Int64("conn_id", conn.id),
+			zap.Int64("request_id", int64(key)),
+		)
 		return conn, nil
+	case <-c.stuck.Ready():
+		c.log.Debug("Some connection dead, try to create new connection, cancel waiting")
 
+		c.freeReq.delete(key)
+		select {
+		default:
+		case conn, ok := <-ch:
+			if ok && conn != nil {
+				c.release(conn)
+			}
+		}
+
+		goto retry
 	case <-ctx.Done():
 		err = ctx.Err()
 	case <-c.ctx.Done():
@@ -246,24 +340,44 @@ func (c *DC) Ready() <-chan struct{} {
 	return c.ready.Ready()
 }
 
+func (c *DC) keepAlive(ctx context.Context) error {
+	c.log.Info("Starting updates connection")
+	defer c.log.Info("Stopping updates connection")
+	for {
+		conn := c.createConnection(0, connModeUpdates)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case <-conn.Dead():
+			c.log.Info("Updates connection dead on session creation, retry to connect", zap.Int64("conn_id", conn.id))
+			continue
+		case <-conn.Ready():
+		}
+
+		c.log.Debug("Waiting for updates", zap.Int64("conn_id", conn.id))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+
+		case <-conn.Dead():
+			c.log.Info("Updates connection dead, retry to connect", zap.Int64("conn_id", conn.id))
+			continue
+		}
+	}
+}
+
 // Run initialize connection pool.
 func (c *DC) Run(ctx context.Context) error {
 	if c.closed.Load() {
 		return errDCIsClosed
 	}
 
-	conn, err := c.acquire(ctx)
-	if err != nil {
-		return err
-	}
-	c.release(conn)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return nil
-	}
+	return c.keepAlive(ctx)
 }
 
 // InvokeRaw sends MTProto request using one of pool connection.
@@ -278,26 +392,36 @@ func (c *DC) InvokeRaw(ctx context.Context, input bin.Encoder, output bin.Decode
 	for {
 		conn, err := c.acquire(ctx)
 		if err != nil {
+			if xerrors.Is(err, errConnDead) {
+				continue
+			}
 			return xerrors.Errorf("acquire connection: %w", err)
 		}
 
+		c.log.Debug("DC Invoke")
 		err = conn.InvokeRaw(ctx, input, output)
-		if conn.dead.Load() {
-			continue
+		c.release(conn)
+		if err != nil {
+			var rpcErr *mtproto.Error
+			if !xerrors.As(err, &rpcErr) {
+				c.log.Info("DC Invoke failed", zap.Error(err))
+				continue
+			}
 		}
 
-		c.release(conn)
+		c.log.Debug("DC Invoke complete")
 		return err
 	}
 }
 
 // Close waits while all ongoing requests will be done or until given context is done.
-// Then, closes the pool.
+// Then, closes the DC.
 func (c *DC) Close(closeCtx context.Context) error {
 	if c.closed.Swap(true) {
 		return xerrors.New("DC already closed")
 	}
-	c.log.Info("DC connection pool closing")
+	c.log.Debug("Closing DC")
+	defer c.log.Debug("DC closed")
 
 	closed, cancel := context.WithCancel(closeCtx)
 	go func() {

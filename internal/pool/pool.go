@@ -194,21 +194,23 @@ func (c *Pool) deleteDC(ctx context.Context, id dcID) error {
 
 func (c *Pool) acquireDC(ctx context.Context, id dcID) (*DC, error) {
 	c.dcsMux.Lock()
-	defer c.dcsMux.Unlock()
 
 	dc, ok := c.dcs[id]
 	if ok {
+		c.dcsMux.Unlock()
 		return dc, nil
 	}
 
 	// If DC pool does not exist, so we create new DC pool.
 	dc, err := c.createDC(ctx, id)
 	if err != nil {
+		c.dcsMux.Unlock()
 		return nil, err
 	}
 
 	// Add DC to DC map.
 	c.dcs[id] = dc
+	c.dcsMux.Unlock()
 
 	// Setup close handler.
 	c.grp.Go(func(grpCtx context.Context) error {
@@ -273,6 +275,7 @@ func (c *Pool) InvokeRaw(ctx context.Context, input bin.Encoder, output bin.Deco
 	dc, _ := c.primary.Load()
 	migration := 0
 	for {
+		c.log.Debug("Pool Invoke")
 		err := c.invokeDC(ctx, dc, input, output)
 
 		var rpcErr *mtproto.Error
@@ -299,6 +302,7 @@ func (c *Pool) InvokeRaw(ctx context.Context, input bin.Encoder, output bin.Deco
 			continue // Retry with given DC.
 		}
 
+		c.log.Debug("Pool Invoke complete")
 		return err
 	}
 }
@@ -329,6 +333,7 @@ func (c *Pool) close(closeCtx context.Context) error {
 		return xerrors.New("Pool already closed")
 	}
 	c.log.Debug("Closing pool")
+	defer c.log.Debug("Pool closed")
 
 	// Cancel all DC tasks to start Close in DC.
 	c.grp.Cancel()

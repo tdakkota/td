@@ -1,6 +1,10 @@
 package mtproto
 
-import "github.com/gotd/td/internal/crypto"
+import (
+	"go.uber.org/zap"
+
+	"github.com/gotd/td/internal/crypto"
+)
 
 // Session represents connection state.
 type Session struct {
@@ -26,6 +30,7 @@ func (c *Conn) newSessionID() error {
 	if err != nil {
 		return err
 	}
+	c.log.Debug("New session ID", zap.Int64("session_id", id))
 
 	c.sessionMux.Lock()
 	defer c.sessionMux.Unlock()
