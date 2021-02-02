@@ -81,10 +81,6 @@ type Client struct {
 	// Session storage.
 	storage clientStorage // immutable,nilable
 
-	// Ready signal channel, sends signal when client connection is ready.
-	// Resets on reconnect.
-	ready *tdsync.ResetReady // immutable
-
 	// Telegram updates handler.
 	updateHandler UpdateHandler // immutable
 }
@@ -137,7 +133,6 @@ func NewClient(appID int, appHash string, opt Options) *Client {
 		updateHandler: opt.UpdateHandler,
 		clock:         opt.Clock,
 		device:        opt.Device,
-		ready:         tdsync.NewResetReady(),
 	}
 
 	// Including version into client logger to help with debugging.

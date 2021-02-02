@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"fmt"
 
 	"go.uber.org/zap"
@@ -109,21 +110,21 @@ func convertUpdateShortSentMessage(u *tg.UpdateShortSentMessage) *tg.UpdateShort
 	}
 }
 
-func (c *Client) processUpdates(updates tg.UpdatesClass) error {
+func (c *Client) processUpdates(ctx context.Context, updates tg.UpdatesClass) error {
 	if c.updateHandler == nil {
 		return nil
 	}
 	switch u := updates.(type) {
 	case *tg.Updates:
-		return c.updateHandler.Handle(c.ctx, u)
+		return c.updateHandler.Handle(ctx, u)
 	case *tg.UpdateShort:
-		return c.updateHandler.HandleShort(c.ctx, u)
+		return c.updateHandler.HandleShort(ctx, u)
 	case *tg.UpdateShortMessage:
-		return c.processUpdates(convertUpdateShortMessage(u))
+		return c.processUpdates(ctx, convertUpdateShortMessage(u))
 	case *tg.UpdateShortChatMessage:
-		return c.processUpdates(convertUpdateShortChatMessage(u))
+		return c.processUpdates(ctx, convertUpdateShortChatMessage(u))
 	case *tg.UpdateShortSentMessage:
-		return c.processUpdates(convertUpdateShortSentMessage(u))
+		return c.processUpdates(ctx, convertUpdateShortSentMessage(u))
 	// TODO(ernado): handle UpdatesTooLong
 	// TODO(ernado): handle UpdatesCombined
 	default:
@@ -137,5 +138,5 @@ func (c *Client) handleUpdates(b *bin.Buffer) error {
 	if err != nil {
 		return xerrors.Errorf("decode updates: %w", err)
 	}
-	return c.processUpdates(updates)
+	return c.processUpdates(c.ctx, updates)
 }

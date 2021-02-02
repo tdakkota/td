@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest"
 	"golang.org/x/xerrors"
 
 	"github.com/gotd/td/internal/tdsync"
@@ -19,7 +21,9 @@ import (
 )
 
 type mtg struct {
-	path string
+	path   string
+	stdout io.Writer
+	stderr io.Writer
 }
 
 type signalWriter struct {
@@ -34,8 +38,8 @@ func (s signalWriter) Write(p []byte) (n int, err error) {
 
 func (m mtg) run(ctx context.Context, secret, addr string, wait *tdsync.Ready) error {
 	cmd := exec.CommandContext(ctx, m.path, "run", "--bind", addr, secret)
-	cmd.Stdout = signalWriter{Writer: os.Stdout, wait: wait}
-	cmd.Stderr = signalWriter{Writer: os.Stderr, wait: wait}
+	cmd.Stdout = signalWriter{Writer: m.stdout, wait: wait}
+	cmd.Stderr = signalWriter{Writer: m.stderr, wait: wait}
 	cmd.Env = append([]string{"MTG_DEBUG=true", "MTG_TEST_DC=true"}, os.Environ()...)
 	return cmd.Run()
 }
@@ -64,6 +68,7 @@ func (m mtg) generateSecret(ctx context.Context, t string) ([]byte, error) {
 func testMTProxy(secretType, addr string, m mtg) func(t *testing.T) {
 	return func(t *testing.T) {
 		a := require.New(t)
+		logger := zaptest.NewLogger(t, zaptest.Level(zapcore.InfoLevel))
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
@@ -89,6 +94,7 @@ func testMTProxy(secretType, addr string, m mtg) func(t *testing.T) {
 			return telegram.TestClient(ctx, telegram.Options{
 				Addr:      addr,
 				Transport: trp,
+				Logger:    logger,
 			}, func(ctx context.Context, client *telegram.Client) error {
 				if _, err := client.Self(ctx); err != nil {
 					return xerrors.Errorf("self: %w", err)
@@ -113,7 +119,13 @@ func TestExternalE2EMTProxy(t *testing.T) {
 		t.Fatal("mtg binary not found", err)
 	}
 
-	m := mtg{path: mtgPath}
+	w := os.Stdout
+	m := mtg{
+		path:   mtgPath,
+		stdout: w,
+		stderr: w,
+	}
+
 	for _, secretType := range []string{"simple", "secured", "tls"} {
 		t.Run(strings.Title(secretType), testMTProxy(secretType, addr, m))
 	}

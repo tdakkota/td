@@ -25,9 +25,10 @@ func (m *mockHandler) HandleShort(ctx context.Context, u *tg.UpdateShort) error 
 }
 
 func TestClient_processUpdates(t *testing.T) {
+	ctx := context.Background()
 	t.Run("Nil handler", func(t *testing.T) {
 		c := new(Client)
-		require.NoError(t, c.processUpdates(nil))
+		require.NoError(t, c.processUpdates(ctx,nil))
 	})
 
 	msg := &tg.Message{
@@ -42,7 +43,7 @@ func TestClient_processUpdates(t *testing.T) {
 		c := new(Client)
 		c.updateHandler = mock
 
-		err := c.processUpdates(&tg.Updates{Updates: []tg.UpdateClass{upd}})
+		err := c.processUpdates(ctx, &tg.Updates{Updates: []tg.UpdateClass{upd}})
 		require.NoError(t, err)
 		require.Equal(t, upd, mock.LastUpdate.Updates[0])
 	})
@@ -52,19 +53,19 @@ func TestClient_processUpdates(t *testing.T) {
 		c := new(Client)
 		c.updateHandler = mock
 
-		err := c.processUpdates(&tg.UpdateShort{Update: upd})
+		err := c.processUpdates(ctx, &tg.UpdateShort{Update: upd})
 		require.NoError(t, err)
 		require.Equal(t, upd, mock.LastShortUpdate.Update)
 
-		err = c.processUpdates(&tg.UpdateShortMessage{ID: 10})
+		err = c.processUpdates(ctx, &tg.UpdateShortMessage{ID: 10})
 		require.NoError(t, err)
 		require.Equal(t, 10, mock.LastShortUpdate.Update.(*tg.UpdateNewMessage).Message.(*tg.Message).ID)
 
-		err = c.processUpdates(&tg.UpdateShortSentMessage{ID: 10})
+		err = c.processUpdates(ctx, &tg.UpdateShortSentMessage{ID: 10})
 		require.NoError(t, err)
 		require.Equal(t, 10, mock.LastShortUpdate.Update.(*tg.UpdateNewMessage).Message.(*tg.Message).ID)
 
-		err = c.processUpdates(&tg.UpdateShortChatMessage{ID: 10})
+		err = c.processUpdates(ctx, &tg.UpdateShortChatMessage{ID: 10})
 		require.NoError(t, err)
 		require.Equal(t, 10, mock.LastShortUpdate.Update.(*tg.UpdateNewMessage).Message.(*tg.Message).ID)
 	})
