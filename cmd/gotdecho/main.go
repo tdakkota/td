@@ -56,6 +56,9 @@ func run(ctx context.Context) error {
 	})
 
 	dispatcher.OnNewMessage(func(ctx tg.UpdateContext, u *tg.UpdateNewMessage) error {
+		if m, ok := u.Message.(interface{ GetOut() bool }); ok && m.GetOut() {
+			return nil
+		}
 		switch m := u.Message.(type) {
 		case *tg.Message:
 			switch peer := m.PeerID.(type) {
