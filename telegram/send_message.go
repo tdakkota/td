@@ -19,5 +19,5 @@ func (c *Client) SendMessage(ctx context.Context, req *tg.MessagesSendMessageReq
 	if err != nil {
 		return err
 	}
-	return c.processUpdates(updates)
+	return c.processUpdates(ctx, updates)
 }
