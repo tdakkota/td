@@ -64,6 +64,7 @@ type Pool struct {
 	// Current Telegram config.
 	cfg *config
 
+	ready  *tdsync.Ready
 	closed atomic.Bool
 }
 
@@ -90,6 +91,7 @@ func NewPool(appID int, handler ConnHandler, opts Options) *Pool {
 		max:            opts.MaxOpenConnections,
 		migrationLimit: opts.MigrationLimit,
 		cfg:            newConfig(),
+		ready:          tdsync.NewReady(),
 	}
 }
 
@@ -254,6 +256,14 @@ func (c *Pool) createDC(ctx context.Context, id dcID) (*DC, error) {
 var errPoolIsClosed = xerrors.New("pool is closed")
 
 func (c *Pool) invokeDC(ctx context.Context, id dcID, input bin.Encoder, output bin.Decoder) (err error) {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	case <-c.ready.Ready():
+	}
+
 	dc, err := c.acquireDC(ctx, id)
 	if err != nil {
 		return xerrors.Errorf("acquire DC: %w", err)
@@ -317,6 +327,7 @@ func (c *Pool) Run(ctx context.Context) error {
 	if err := c.restoreConnection(ctx); err != nil {
 		return xerrors.Errorf("restore connection: %w", err)
 	}
+	c.ready.Signal()
 
 	id, _ := c.primary.Load()
 	_, err := c.acquireDC(ctx, id)

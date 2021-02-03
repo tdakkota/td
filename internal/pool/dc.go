@@ -128,7 +128,6 @@ func (c *DC) OnSession(addr string, cfg tg.Config, s mtproto.Session) error {
 	if noSessionBefore {
 		c.log.Debug("DC Session saved")
 	}
-	c.ready.Signal()
 
 	return c.handler.OnSession(addr, cfg, s)
 }
@@ -248,6 +247,7 @@ func (c *DC) acquire(ctx context.Context) (r *poolConn, err error) {
 	case <-c.ctx.Done(): // If DC forcibly closed — exit.
 		return nil, xerrors.Errorf("DC closed: %w", c.ctx.Err())
 	case <-c.ready.Ready(): // Await for ready if it not a initialization connection.
+		c.log.Debug("Wait for DC ready")
 	}
 
 retry:
@@ -354,8 +354,12 @@ func (c *DC) keepAlive(ctx context.Context) error {
 			c.log.Info("Updates connection dead on session creation, retry to connect", zap.Int64("conn_id", conn.id))
 			continue
 		case <-conn.Ready():
+			if _, err := tg.NewClient(conn).HelpGetConfig(ctx); err != nil {
+				c.log.Info("Get config failed", zap.Error(err))
+			}
 		}
 
+		c.ready.Signal()
 		c.log.Debug("Waiting for updates", zap.Int64("conn_id", conn.id))
 		select {
 		case <-ctx.Done():

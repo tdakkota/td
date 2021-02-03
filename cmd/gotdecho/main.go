@@ -14,6 +14,7 @@ import (
 	"golang.org/x/net/proxy"
 	"golang.org/x/xerrors"
 
+	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
@@ -46,10 +47,8 @@ func run(ctx context.Context) error {
 
 	dispatcher := tg.NewUpdateDispatcher()
 	client := telegram.NewClient(appID, appHash, telegram.Options{
-		Logger: logger,
-		SessionStorage: &telegram.FileSessionStorage{
-			Path: filepath.Join(sessionDir, "session.json"),
-		},
+		Logger:         logger,
+		SessionStorage: &session.StorageMemory{},
 
 		Transport:     transport.Intermediate(transport.DialFunc(proxy.Dial)),
 		UpdateHandler: dispatcher,
